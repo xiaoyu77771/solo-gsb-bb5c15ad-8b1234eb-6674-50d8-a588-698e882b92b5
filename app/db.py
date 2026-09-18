@@ -49,6 +49,33 @@ CREATE TABLE IF NOT EXISTS reservation_events (
     canonical_event TEXT NOT NULL,     -- 实际参与哈希的规范化 JSON（不含哈希字段）
     PRIMARY KEY (reservation_id, seq)
 );
+CREATE TABLE IF NOT EXISTS reservation_holds (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    hold_key        TEXT NOT NULL,     -- 客户端幂等键：仅 pending 保留要求唯一（部分唯一索引）
+    start_utc       TEXT NOT NULL,
+    end_utc         TEXT NOT NULL,
+    participants_key TEXT NOT NULL,    -- 规范化参与者列表（去重排序后的 JSON）
+    ttl_seconds     INTEGER NOT NULL,  -- 保留有效期（1..900 秒）
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending=待确认；confirmed=已转正式预约；expired=已过期
+    reservation_id  INTEGER REFERENCES reservations(id),  -- confirmed 后指向正式预约
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,     -- created_at + ttl_seconds；事务内据此惰性过期
+    confirmed_at    TEXT,
+    expired_at      TEXT
+);
+CREATE TABLE IF NOT EXISTS reservation_hold_participants (
+    hold_id        INTEGER NOT NULL REFERENCES reservation_holds(id) ON DELETE CASCADE,
+    participant_id TEXT NOT NULL,
+    start_utc      TEXT NOT NULL,
+    end_utc        TEXT NOT NULL,
+    PRIMARY KEY (hold_id, participant_id)
+);
+CREATE INDEX IF NOT EXISTS idx_hp_participant_window
+    ON reservation_hold_participants (participant_id, start_utc, end_utc);
+-- 同一 hold_key 同时至多有一条 pending 保留；confirmed/expired 行保留用于
+-- 幂等重放与审计，且不阻止该 key 被重新申请。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_holds_hold_key_pending
+    ON reservation_holds (hold_key) WHERE status = 'pending';
 """
 
 _init_lock = threading.Lock()

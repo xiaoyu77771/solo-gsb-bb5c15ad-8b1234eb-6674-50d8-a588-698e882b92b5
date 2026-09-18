@@ -166,6 +166,54 @@ class ReservationRescheduleIn(_ReservationWindowBase):
     )
 
 
+class ReservationHoldIn(_ReservationWindowBase):
+    """临时保留创建请求：幂等 hold_key + 半开区间参与者占用 + TTL 秒数。"""
+
+    hold_key: str = Field(
+        min_length=1, max_length=200,
+        description=(
+            "客户端幂等键：相同键 + 相同规范化内容（含 ttl_seconds）重试"
+            "返回原 pending 保留；键相同但内容不同返回 409"
+        ),
+        examples=["hold-7c21"],
+    )
+    ttl_seconds: int = Field(
+        ge=1, le=900,
+        description="保留有效期（秒），1..900；到期后保留在写事务内惰性过期",
+        examples=[300],
+    )
+
+
+class ReservationHoldConfirmIn(BaseModel):
+    """临时保留确认请求：request_id 作为转成正式预约后的幂等请求标识。"""
+
+    request_id: str = Field(
+        min_length=1, max_length=200,
+        description="正式预约的客户端幂等请求标识（写入 reservations.request_id）",
+        examples=["req-confirm-1"],
+    )
+
+
+class ReservationHoldOut(BaseModel):
+    hold_id: int
+    hold_key: str
+    start_utc: str = Field(description="UTC 开始时间 ISO 8601", examples=["2026-03-09T13:00:00Z"])
+    end_utc: str
+    participants: list[str] = Field(description="参与者 id，去重后按字典序排列")
+    ttl_seconds: int = Field(description="保留有效期（秒，1..900）", examples=[300])
+    status: Literal["pending", "confirmed", "expired"] = Field(
+        description="保留状态：pending=待确认（未过期）；confirmed=已转正式预约；expired=已过期",
+        examples=["pending"],
+    )
+    reservation_id: int | None = Field(
+        default=None,
+        description="confirmed 后关联的正式预约 ID；pending/expired 为 null",
+    )
+    created_at: str
+    expires_at: str = Field(description="过期时刻 ISO 8601（created_at + ttl_seconds）")
+    confirmed_at: str | None = None
+
+
 class ReservationOut(BaseModel):
     reservation_id: int
     request_id: str

@@ -32,14 +32,21 @@ _CANON_FMT = audit.CANON_FMT
 
 
 class ReservationConflictError(Exception):
-    """至少一位参与者与已有预约存在半开区间重叠。"""
+    """至少一位参与者与已有预约或有效临时保留存在半开区间重叠。"""
 
     def __init__(self, conflicts: list[dict[str, object]]) -> None:
-        self.conflicts = conflicts  # [{"reservation_id": ..., "participant_id": ...}]
-        pretty = ", ".join(
-            f"participant {c['participant_id']!r} overlaps reservation #{c['reservation_id']}"
-            for c in conflicts
-        )
+        # 冲突项形如 {"reservation_id": ..., "participant_id": ...}
+        # 或       {"hold_id": ..., "participant_id": ...}
+        self.conflicts = conflicts
+
+        def _describe(c: dict[str, object]) -> str:
+            if "hold_id" in c:
+                return (f"participant {c['participant_id']!r} overlaps "
+                        f"reservation hold #{c['hold_id']}")
+            return (f"participant {c['participant_id']!r} overlaps "
+                    f"reservation #{c['reservation_id']}")
+
+        pretty = ", ".join(_describe(c) for c in conflicts)
         super().__init__(f"reservation conflict: {pretty}")
 
 
@@ -131,6 +138,122 @@ def _row_to_reservation(row: sqlite3.Row) -> Reservation:
     )
 
 
+def load_reservation(
+    conn: sqlite3.Connection, reservation_id: int
+) -> Reservation | None:
+    """在调用方已打开的连接/事务内按 ID 读取预约，不存在返回 ``None``。"""
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLUMNS} FROM reservations WHERE id = ?",
+        (reservation_id,),
+    ).fetchone()
+    return _row_to_reservation(row) if row is not None else None
+
+
+def _expire_due_holds(conn: sqlite3.Connection, now_s: str) -> None:
+    """事务内惰性过期：把所有已到期的 pending 保留标记为 ``expired``。
+
+    在每个 ``BEGIN IMMEDIATE`` 事务入口调用：状态翻转与随后的冲突检查
+    在同一事务完成，过期保留不再占用时段。惰性导入避免与 holds 模块循环导入。
+    """
+    from . import holds
+    holds.expire_due_holds(conn, now_s)
+
+
+def collect_reservation_conflicts(
+    conn: sqlite3.Connection,
+    participants: tuple[str, ...],
+    start_s: str,
+    end_s: str,
+    *,
+    exclude_reservation_id: int | None = None,
+) -> list[dict[str, object]]:
+    """收集与**进行中预约**的半开区间冲突（相邻区间因等号不成立而不命中）。
+
+    ``exclude_reservation_id`` 用于改期路径排除自身旧占用。
+    """
+    conflicts: list[dict[str, object]] = []
+    sql = (
+        "SELECT reservation_id, participant_id"
+        " FROM reservation_participants"
+        " WHERE participant_id = ? AND start_utc < ? AND ? < end_utc"
+    )
+    params: list[object] = []
+    if exclude_reservation_id is not None:
+        sql += " AND reservation_id != ?"
+        params.append(exclude_reservation_id)
+    sql += " ORDER BY reservation_id"
+    for pid in participants:
+        for hit in conn.execute(sql, (pid, end_s, start_s, *params)):
+            conflicts.append({
+                "reservation_id": hit["reservation_id"],
+                "participant_id": hit["participant_id"],
+            })
+    return conflicts
+
+
+def _collect_hold_conflicts(
+    conn: sqlite3.Connection,
+    participants: tuple[str, ...],
+    start_s: str,
+    end_s: str,
+    now_s: str,
+) -> list[dict[str, object]]:
+    """收集与**未过期 pending 临时保留**的半开区间冲突（惰性导入避免循环）。"""
+    from . import holds
+    return holds.collect_hold_conflicts(
+        conn, participants, start_s, end_s, now_s)
+
+
+def insert_reservation(
+    conn: sqlite3.Connection,
+    *,
+    request_id: str,
+    start_s: str,
+    end_s: str,
+    participants: tuple[str, ...],
+    now_s: str,
+) -> int:
+    """在调用方事务内写入预约 + 参与者占用 + ``created`` 审计事件，返回新预约 ID。
+
+    供创建接口与临时保留确认接口共用：不自行提交，与调用方业务写入同生共死。
+    """
+    participants_key = json.dumps(list(participants), ensure_ascii=False)
+    cursor = conn.execute(
+        "INSERT INTO reservations"
+        " (request_id, start_utc, end_utc, participants_key, version, created_at)"
+        " VALUES (?, ?, ?, ?, 1, ?)",
+        (request_id, start_s, end_s, participants_key, now_s),
+    )
+    reservation_id = int(cursor.lastrowid)
+    conn.executemany(
+        "INSERT INTO reservation_participants"
+        " (reservation_id, participant_id, start_utc, end_utc)"
+        " VALUES (?, ?, ?, ?)",
+        [(reservation_id, pid, start_s, end_s) for pid in participants],
+    )
+    # 审计事件与业务写入同一事务：COMMIT 前任一失败则整体回滚，
+    # 不会出现“有预约无事件”或“有事件无预约”
+    snapshot = audit.build_snapshot(
+        reservation_id=reservation_id,
+        request_id=request_id,
+        start_utc=start_s,
+        end_utc=end_s,
+        participants=participants,
+        version=1,
+        status="active",
+        canceled_at=None,
+        created_at=now_s,
+    )
+    audit.append_event(
+        conn,
+        reservation_id=reservation_id,
+        action="created",
+        timestamp=now_s,
+        snapshot=snapshot,
+    )
+    return reservation_id
+
+
 def create_reservation(
     request_id: str,
     start_utc: datetime,
@@ -158,6 +281,10 @@ def create_reservation(
         # 使“检查 + 写入”对并发请求原子（并发写者被串行化）。
         conn.execute("BEGIN IMMEDIATE")
         try:
+            now_s = _canon(datetime.now(timezone.utc))
+            # 事务内先惰性过期到期保留，随后冲突检查只面对有效占用
+            _expire_due_holds(conn, now_s)
+
             row = conn.execute(
                 f"SELECT {_RESERVATION_COLUMNS}"
                 " FROM reservations WHERE request_id = ?",
@@ -171,57 +298,20 @@ def create_reservation(
                     return _row_to_reservation(row), False
                 raise RequestIdConflictError(row["id"])
 
-            conflicts: list[dict[str, object]] = []
-            for pid in participants:
-                # 半开区间重叠：existing.start < new.end 且 new.start < existing.end
-                # （相邻区间因等号不成立而不会命中）
-                for hit in conn.execute(
-                    "SELECT reservation_id, participant_id"
-                    " FROM reservation_participants"
-                    " WHERE participant_id = ? AND start_utc < ? AND ? < end_utc"
-                    " ORDER BY reservation_id",
-                    (pid, end_s, start_s),
-                ):
-                    conflicts.append({
-                        "reservation_id": hit["reservation_id"],
-                        "participant_id": hit["participant_id"],
-                    })
+            conflicts = collect_reservation_conflicts(
+                conn, participants, start_s, end_s)
+            conflicts.extend(_collect_hold_conflicts(
+                conn, participants, start_s, end_s, now_s))
             if conflicts:
                 raise ReservationConflictError(conflicts)
 
-            now_s = _canon(datetime.now(timezone.utc))
-            cursor = conn.execute(
-                "INSERT INTO reservations"
-                " (request_id, start_utc, end_utc, participants_key, version, created_at)"
-                " VALUES (?, ?, ?, ?, 1, ?)",
-                (request_id, start_s, end_s, participants_key, now_s),
-            )
-            reservation_id = int(cursor.lastrowid)
-            conn.executemany(
-                "INSERT INTO reservation_participants"
-                " (reservation_id, participant_id, start_utc, end_utc)"
-                " VALUES (?, ?, ?, ?)",
-                [(reservation_id, pid, start_s, end_s) for pid in participants],
-            )
-            # 审计事件与业务写入同一事务：COMMIT 前任一失败则整体回滚，
-            # 不会出现“有预约无事件”或“有事件无预约”
-            snapshot = audit.build_snapshot(
-                reservation_id=reservation_id,
-                request_id=request_id,
-                start_utc=start_s,
-                end_utc=end_s,
-                participants=participants,
-                version=1,
-                status="active",
-                canceled_at=None,
-                created_at=now_s,
-            )
-            audit.append_event(
+            reservation_id = insert_reservation(
                 conn,
-                reservation_id=reservation_id,
-                action="created",
-                timestamp=now_s,
-                snapshot=snapshot,
+                request_id=request_id,
+                start_s=start_s,
+                end_s=end_s,
+                participants=participants,
+                now_s=now_s,
             )
             conn.execute("COMMIT")
             return Reservation(
@@ -279,6 +369,9 @@ def reschedule_reservation(
         # “存在性 + 版本 + 冲突检查 + 替换” 对并发请求原子。
         conn.execute("BEGIN IMMEDIATE")
         try:
+            now_s = _canon(datetime.now(timezone.utc))
+            _expire_due_holds(conn, now_s)
+
             row = conn.execute(
                 f"SELECT {_RESERVATION_COLUMNS} FROM reservations WHERE id = ?",
                 (reservation_id,),
@@ -293,22 +386,14 @@ def reschedule_reservation(
             if expected_version != current_version:
                 raise VersionConflictError(reservation_id, current_version)
 
-            conflicts: list[dict[str, object]] = []
-            for pid in participants:
-                # 半开区间重叠（同创建路径），reservation_id != ? 排除自身：
-                # 改期前自己在该参与者上的旧占用不应被视为冲突。
-                for hit in conn.execute(
-                    "SELECT reservation_id, participant_id"
-                    " FROM reservation_participants"
-                    " WHERE participant_id = ? AND start_utc < ? AND ? < end_utc"
-                    " AND reservation_id != ?"
-                    " ORDER BY reservation_id",
-                    (pid, end_s, start_s, reservation_id),
-                ):
-                    conflicts.append({
-                        "reservation_id": hit["reservation_id"],
-                        "participant_id": hit["participant_id"],
-                    })
+            # 半开区间重叠（同创建路径），reservation_id != ? 排除自身：
+            # 改期前自己在该参与者上的旧占用不应被视为冲突。
+            conflicts = collect_reservation_conflicts(
+                conn, participants, start_s, end_s,
+                exclude_reservation_id=reservation_id)
+            # 未过期的临时保留同样占用时段（保留之间不排除自身）
+            conflicts.extend(_collect_hold_conflicts(
+                conn, participants, start_s, end_s, now_s))
             if conflicts:
                 raise ReservationConflictError(conflicts)
 
@@ -332,9 +417,8 @@ def reschedule_reservation(
                 " VALUES (?, ?, ?, ?)",
                 [(reservation_id, pid, start_s, end_s) for pid in participants],
             )
-            now_s = _canon(datetime.now(timezone.utc))
             # 同事务追加 rescheduled 审计事件：快照为改期后的新状态，
-            # request_id / created_at 沿用原值
+            # request_id / created_at 沿用原值；now_s 取事务入口时刻
             snapshot = audit.build_snapshot(
                 reservation_id=reservation_id,
                 request_id=row["request_id"],
