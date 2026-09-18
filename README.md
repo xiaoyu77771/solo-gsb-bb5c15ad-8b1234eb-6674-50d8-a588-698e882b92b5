@@ -2,7 +2,8 @@
 
 基于 **Python + FastAPI + 标准库 `zoneinfo`** 的会议候选时段聚合服务，
 并附带 **SQLite 持久化的会议预约接口**（幂等创建、乐观锁版本改期、
-软删除取消、单事务冲突检测、**可校验的 SHA-256 哈希链变更历史**）。
+软删除取消、单事务冲突检测、**可校验的 SHA-256 哈希链变更历史**、
+**短时临时保留 hold 与确认转正式预约**）。
 
 每位参与者按**本地星期与钟面时刻**填写每周重复的可用区间并给出 IANA 时区
 （如 `Asia/Shanghai`），服务按具体日期应用夏令时（DST）规则，统一换算到 UTC，
@@ -33,11 +34,12 @@
 app/
   scheduling.py    # 聚合核心：本地时刻换算、跨午夜拆分、扫描线、排序
   reservations.py  # 预约核心：规范化、幂等创建、乐观锁版本改期/取消、单事务冲突检测、历史读取
+  holds.py         # 临时保留核心：TTL 占位、忽略过期保留的冲突检查、确认转正式预约
   audit.py         # 审计事件：canonical JSON、SHA-256 哈希链追加与整链重验
-  db.py            # SQLite 连接管理、建表与无损迁移（补列 / 补 baseline 事件）
+  db.py            # SQLite 连接管理、建表与无损迁移（补列 / 补 baseline 事件 / 新增保留表）
   schemas.py       # Pydantic 请求/响应模型
   main.py          # FastAPI 路由
-tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、哈希链/篡改/迁移）
+tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、保留 TTL/过期/确认、哈希链/篡改/迁移）
 Dockerfile
 docker-compose.yml
 requirements.txt  # 运行依赖
@@ -70,6 +72,9 @@ docker compose up --build
 在同一迁移事务内补写一条 `baseline` 事件（序号 1、首哈希为 64 个 0，
 快照如实记录初始化时观测到的预约状态，事件时间取迁移时刻——**不伪造**
 过去的创建/改期/取消操作）；迁移可重复执行，已有事件不会重复补写。
+升级到带**临时保留**的版本后首次启动时，仅以 `CREATE TABLE IF NOT EXISTS`
+**无损新增** `reservation_holds` / `reservation_hold_participants` 两张表及索引，
+不改动任何既有表与数据，重复启动幂等。
 
 服务启动后访问 <http://localhost:8000>（Swagger UI 在 <http://localhost:8000/docs>）。
 若 8000 端口被占用：
@@ -385,6 +390,115 @@ curl -s -X DELETE 'http://localhost:8000/api/v1/reservations/1?expected_version=
 
 其他错误：`404`（预约不存在）、`422`（缺少 `expected_version` 或其值 `< 1`）。
 
+### `POST /api/v1/reservation-holds`
+
+创建**预约临时保留**（短 TTL 占位，用于“先占坑、稍后确认”）。请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `hold_key` | 非空字符串（≤200） | 客户端幂等键；相同键 + 相同规范化内容重试返回原保留 |
+| `start_utc` / `end_utc` | ISO 8601（须带时区偏移，如 `...Z`） | UTC 起止时刻；`end_utc` 必须晚于 `start_utc` |
+| `participant_ids` | 非空字符串数组 | 参与者 ID；去重并排序后存储并参与冲突检查 |
+| `ttl_seconds` | 整数，`1..900` | 保留有效期（秒）；过期未确认自动失效并释放占位 |
+
+语义：
+
+- **原子占位**：检查与写入在单个 `BEGIN IMMEDIATE` 事务内完成，并发请求被串行化；
+  只要任一参与者与**进行中预约**（`reservation_participants` 占用）或**其他有效保留**
+  （`pending` 且 `expires_at > now`）存在半开区间重叠（`existing.start < new.end`
+  且 `new.start < existing.end`），整个请求被拒绝（`409` + 冲突明细，
+  冲突条目带 `kind: "reservation"` / `"hold"` 及对应 ID），不留下任何部分写入。
+  **相邻区间不冲突**。
+- **过期保留被忽略**：已过期（`pending` 且 `expires_at <= now`）与已确认的保留
+  一律不参与冲突检查；其行保留在库中作记录，不做物理删除。
+- **幂等**：相同 `hold_key` 的最新一条仍是未过期 `pending` 保留时，相同规范化内容
+  （起止时刻、去重排序后的参与者、`ttl_seconds`）重试 → `200` 返回原保留；
+  内容不同 → `409`（响应给出 `existing_hold_id`）。已过期或已确认的
+  `hold_key` 可直接复用新建。
+- 时间窗口与参与者的校验规则与正式预约一致（时区偏移必填、`end > start` 等）；
+  `ttl_seconds` 超出 `1..900` → `422`。
+
+请求示例：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/reservation-holds \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hold_key": "hold-7c21",
+    "start_utc": "2026-03-09T13:00:00Z",
+    "end_utc": "2026-03-09T14:00:00Z",
+    "participant_ids": ["alice", "bob"],
+    "ttl_seconds": 120
+  }'
+```
+
+成功响应（`201`，幂等重放为 `200`）：
+
+```json
+{
+  "hold_id": 1,
+  "hold_key": "hold-7c21",
+  "start_utc": "2026-03-09T13:00:00Z",
+  "end_utc": "2026-03-09T14:00:00Z",
+  "participants": ["alice", "bob"],
+  "ttl_seconds": 120,
+  "status": "pending",
+  "created_at": "2026-09-18T05:09:48.886605Z",
+  "expires_at": "2026-09-18T05:11:48.886605Z",
+  "confirmed_at": null,
+  "reservation_id": null,
+  "request_id": null
+}
+```
+
+冲突响应（`409`，`conflicts[].kind` 区分撞上的是正式预约还是另一条保留）：
+
+```json
+{
+  "detail": "reservation hold conflict: participant 'bob' overlaps hold #1",
+  "conflicts": [
+    {"kind": "hold", "reservation_id": null, "hold_id": 1, "participant_id": "bob"}
+  ]
+}
+```
+
+### `POST /api/v1/reservation-holds/{hold_id}/confirm`
+
+在保留过期前确认：在**同一事务**内把保留转为正式预约。请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `request_id` | 非空字符串（≤200） | 正式预约的客户端幂等请求标识 |
+
+语义（全部在单个 `BEGIN IMMEDIATE` 事务内完成，失败整体回滚）：
+
+- 保留不存在 → `404`；
+- 保留为 `pending` 但已过期（`expires_at <= now`）→ `410 Gone`，
+  保留不被确认、不产生预约或审计事件；
+- 保留已 `confirmed`（**重复确认**，与之后是否过期无关）→ `200`
+  **幂等返回同一预约**（`reservation_id` 不变，不新增事件）；
+- 未过期 `pending`：先复检与进行中预约及其他有效保留的半开区间冲突
+  （保留创建后可能又有直接创建的正式预约或并发确认落入同一时段）→
+  有冲突 `409` + 明细、保留不变；`request_id` 已被内容不同的预约占用 → `409`；
+- 全部通过后插入正式预约与参与者占用、在**同一事务**追加 `created` 哈希链
+  审计事件，并把保留标记为 `confirmed`（回填 `reservation_id` / `request_id` /
+  `confirmed_at`）→ `201` 返回新预约（结构同 `POST /api/v1/reservations`）。
+  确认产生的正式预约可正常改期/取消/查询历史。
+
+请求示例：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/reservation-holds/1/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id": "req-9f3a"}'
+```
+
+过期未确认（`410`）：
+
+```json
+{ "detail": "reservation hold #2 has expired" }
+```
+
 ### `GET /api/v1/reservations/{reservation_id}/history`
 
 返回预约的**可校验变更历史**：按序（`seq` 升序）列出审计事件，服务端在返回前
@@ -501,6 +615,14 @@ for ev in history["events"]:
   同一结果、其他版本 409、取消后改期 409 不复活、并发取消仅一次实际变更；
   以及**旧版数据库启动时无损补齐 `version=1`、`status='active'`、
   `canceled_at=NULL`** 的迁移。
+- **临时保留**：创建返回 hold_id/expires_at、`ttl_seconds` 1..900 边界与 422、
+  与进行中预约/其他有效保留的半开区间冲突 409（含冲突种类与参与者明细）、
+  相邻区间不冲突、取消预约释放后可占位、冲突无部分写入、过期保留在冲突检查中
+  被忽略、已确认保留以正式预约身份参与检查；hold_key 幂等重放 200/内容不同 409/
+  过期与确认后可复用；确认转正式预约 201 并追加 `created` 事件、标记 confirmed、
+  重复确认 200 返回同一预约（确认后再过期仍幂等）、过期确认 410 且不写入、
+  不存在 404、request_id 撞键 409、确认前被直接预约抢占则 409 且保留不变；
+  并发保留单赢家、并发确认只建一条预约；旧库无损新增保留表后既有预约不受影响。
 - **变更历史（哈希链）**：成功创建/改期/取消各在同事务追加事件、序号从 1
   连续递增、快照与版本跟随；`canonical_event` 紧凑/键排序/非 ASCII 不转义；
   首条 `prev_hash` 为 64 个 0，可按公式独立重算整链；GET 历史按序返回、

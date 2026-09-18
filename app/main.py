@@ -13,6 +13,7 @@ from fastapi import FastAPI, Query, Response
 from fastapi.responses import JSONResponse
 
 from . import db as db_module
+from . import holds as hold_core
 from . import reservations as reservation_core
 from . import scheduling
 from .audit import CANON_FMT as _AUDIT_CANON_FMT, ChainVerificationError
@@ -23,6 +24,12 @@ from .reservations import (
     ReservationNotFoundError,
     VersionConflictError,
 )
+from .holds import (
+    HoldConflictError,
+    HoldExpiredError,
+    HoldKeyConflictError,
+    HoldNotFoundError,
+)
 from .scheduling import SchedulingError
 from .schemas import (
     AggregationRequest,
@@ -31,6 +38,9 @@ from .schemas import (
     LocalTimeOut,
     ParticipantIn,
     ReservationHistoryOut,
+    ReservationHoldConfirmIn,
+    ReservationHoldIn,
+    ReservationHoldOut,
     ReservationIn,
     ReservationOut,
     ReservationRescheduleIn,
@@ -58,8 +68,11 @@ app = FastAPI(
         "支持带乐观版本号的改期（PUT）与软删除取消（DELETE，取消后时段立即释放）；"
         "每次成功的创建/改期/取消都在同一事务追加 SHA-256 哈希链审计事件，"
         "可通过 GET 历史接口按序获取并由服务端重验整链。"
+        "另提供预约临时保留（hold）：短时 TTL 占位（创建时与进行中预约及其他"
+        "有效保留按半开区间检查冲突、忽略已过期保留），可在过期前原子确认为"
+        "正式预约并追加 created 审计事件。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -127,6 +140,38 @@ async def chain_verification_error_handler(
         status_code=409,
         content={"detail": f"reservation history chain verification failed: {exc}"},
     )
+
+
+@app.exception_handler(HoldConflictError)
+async def hold_conflict_handler(request, exc: HoldConflictError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "conflicts": exc.conflicts,
+        },
+    )
+
+
+@app.exception_handler(HoldKeyConflictError)
+async def hold_key_conflict_handler(request, exc: HoldKeyConflictError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "existing_hold_id": exc.hold_id,
+        },
+    )
+
+
+@app.exception_handler(HoldNotFoundError)
+async def hold_not_found_handler(request, exc: HoldNotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(HoldExpiredError)
+async def hold_expired_handler(request, exc: HoldExpiredError) -> JSONResponse:
+    return JSONResponse(status_code=410, content={"detail": str(exc)})
 
 
 @app.get("/health")
@@ -346,3 +391,81 @@ def get_reservation_history(reservation_id: int) -> ReservationHistoryOut:
             for e in events
         ],
     )
+
+
+# ------------------------------------------------------- reservation holds
+
+
+def _hold_to_out(h: hold_core.Hold) -> ReservationHoldOut:
+    return ReservationHoldOut(
+        hold_id=h.id,
+        hold_key=h.hold_key,
+        start_utc=_iso_z(h.start_utc),
+        end_utc=_iso_z(h.end_utc),
+        participants=list(h.participants),
+        ttl_seconds=h.ttl_seconds,
+        status=h.status,
+        created_at=_iso_z(h.created_at),
+        expires_at=_iso_z(h.expires_at),
+        confirmed_at=_iso_z(h.confirmed_at) if h.confirmed_at is not None else None,
+        reservation_id=h.reservation_id,
+        request_id=h.request_id,
+    )
+
+
+@app.post(
+    "/api/v1/reservation-holds",
+    response_model=ReservationHoldOut,
+    status_code=201,
+)
+def create_reservation_hold(req: ReservationHoldIn, response: Response) -> ReservationHoldOut:
+    """创建预约临时保留（短 TTL 占位）。
+
+    - 单个 ``BEGIN IMMEDIATE`` 事务内，忽略已过期（pending 且
+      ``expires_at <= now``）的保留，对**进行中预约**与**其他有效保留**
+      逐参与者做半开区间 ``[start, end)`` 重叠检查（相邻区间不冲突）；
+      任一重叠 → ``409`` + 冲突明细，整体回滚、不写入；
+    - 相同 ``hold_key`` + 相同规范化内容（起止时刻、去重排序后的参与者、
+      ``ttl_seconds``）的重试（最新一条仍是未过期 pending 保留）→ ``200``
+      返回原保留，不新增记录；同 key 内容不同 → ``409``；
+    - 已过期或已确认的 ``hold_key`` 可直接复用新建。
+    """
+    hold, created = hold_core.create_hold(
+        hold_key=req.hold_key,
+        start_utc=req.start_utc,
+        end_utc=req.end_utc,
+        participant_ids=req.participant_ids,
+        ttl_seconds=req.ttl_seconds,
+    )
+    if not created:
+        # 幂等重放：返回原保留
+        response.status_code = 200
+    return _hold_to_out(hold)
+
+
+@app.post(
+    "/api/v1/reservation-holds/{hold_id}/confirm",
+    response_model=ReservationOut,
+    status_code=201,
+)
+def confirm_reservation_hold(
+    hold_id: int, req: ReservationHoldConfirmIn, response: Response
+) -> ReservationOut:
+    """确认临时保留：在同一事务转为正式预约。
+
+    - 保留不存在 → ``404``；
+    - pending 但已过期（``expires_at <= now``）→ ``410``，保留不被确认；
+    - 已确认（含重复确认，与过期与否无关）→ ``200`` 幂等返回**同一预约**；
+    - 未过期 pending → 单个 ``BEGIN IMMEDIATE`` 事务内复检与进行中预约及
+      其他有效保留的半开区间冲突（有冲突 → ``409`` + 明细，保留不变），
+      通过后插入正式预约与参与者占用、同事务追加 ``created`` 审计事件，
+      并把保留标记为 ``confirmed``，``201`` 返回新预约。
+    """
+    reservation, created = hold_core.confirm_hold(
+        hold_id=hold_id,
+        request_id=req.request_id,
+    )
+    if not created:
+        # 重复确认：返回同一预约
+        response.status_code = 200
+    return _reservation_to_out(reservation)
